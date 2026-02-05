@@ -1,0 +1,12 @@
+name: 🧪 测试定时任务
+
+on:
+  schedule:
+    - cron: '* * * * *'  # 每分钟运行，用于测试
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "✅ 定时任务正常 - $(date)"
