@@ -1,264 +1,348 @@
-name: 自动合并IPTV列表（每8分钟·优化版）
+name: 🕙 自动合并IPTV列表（10分钟版）
 
 on:
   schedule:
-    # 每8分钟运行一次（UTC时间）
-    - cron: '*/8 * * * *'
-  workflow_dispatch:
+    # 每10分钟运行一次（优化后的可靠间隔）
+    - cron: '*/10 * * * *'
+  workflow_dispatch:  # 手动触发
   push:
     paths:
       - '.github/workflows/merge-iptv.yml'
+      - 'heartbeat.txt'  # 心跳文件变化也触发
 
 jobs:
   merge-iptv:
     runs-on: ubuntu-latest
-    timeout-minutes: 5  # 防止任务无限挂起
+    timeout-minutes: 5
+    # 防止并发执行冲突
+    concurrency:
+      group: merge-iptv-${{ github.ref }}
+      cancel-in-progress: false
     
     steps:
-      - name: 1. 初始化环境
+      - name: 1. 检查运行条件
+        id: check
         run: |
-          echo "🔄 工作流开始执行：$(date '+%Y-%m-%d %H:%M:%S')"
-          echo "📱 运行器信息：$(uname -a)"
-          echo "📦 仓库：${{ github.repository }}"
+          echo "🕙 工作流开始执行：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "📱 运行器：${{ runner.os }} ${{ runner.arch }}"
           
-      - name: 2. 检出仓库代码（带深度清理）
+          # 避免过于频繁的触发
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.event.head_commit.message }}" == *"心跳更新"* ]]; then
+            echo "💓 心跳触发，继续执行..."
+          fi
+          
+          echo "check_passed=true" >> $GITHUB_OUTPUT
+          
+      - name: 2. 检出代码（优化版）
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1  # 只获取最新提交，提高速度
-          clean: true     # 清理工作区
+          fetch-depth: 1
+          clean: true
+          # 增加重试次数
+          retry-on-error: true
+          max-attempts: 3
           
-      - name: 3. 智能下载源文件（带完整错误处理）
+      - name: 3. 并行下载源文件
         id: download
+        timeout-minutes: 3
         run: |
-          set -e  # 任何命令失败则立即停止
+          set -e
+          echo "📥 开始并行下载源文件..."
           
-          # 函数：安全下载文件
-          safe_download() {
+          # 创建下载函数
+          download_with_retry() {
             local url=$1
             local output=$2
             local name=$3
+            local max_retries=3
+            local retry_delay=5
             
-            echo "📥 开始下载 $name..."
-            
-            # 尝试下载，捕获更多信息
-            HTTP_STATUS=$(curl -s -L -w "%{http_code}" \
-              --max-time 45 \
-              --retry 3 \
-              --retry-delay 2 \
-              --retry-max-time 120 \
-              -o "$output.tmp" \
-              "$url" 2>&1 | tail -n1)
-            
-            if [ "$HTTP_STATUS" -eq 200 ]; then
-              # 验证文件是否有效（非空且包含M3U特征）
-              if [ -s "$output.tmp" ] && (head -1 "$output.tmp" | grep -q "^#EXTM3U\|^#EXTINF" || tail -n +2 "$output.tmp" | grep -q "^#EXTINF"); then
-                mv "$output.tmp" "$output"
-                LINES=$(wc -l < "$output" | tr -d ' ')
-                echo "✅ $name 下载成功 ($LINES 行, HTTP $HTTP_STATUS)"
-                echo "$name"_count=$(grep -c "^#EXTINF" "$output" || echo "0") >> $GITHUB_OUTPUT
-                return 0
-              else
-                echo "⚠️ $name 文件内容无效或格式错误"
-                rm -f "$output.tmp"
-                return 1
+            for ((i=1; i<=max_retries; i++)); do
+              echo "尝试 $i/$max_retries 下载 $name..."
+              
+              # 使用curl下载，设置超时和重试
+              if curl -s -L \
+                --max-time 30 \
+                --connect-timeout 20 \
+                --retry 2 \
+                --retry-delay 3 \
+                -o "$output.tmp" \
+                "$url" 2>/dev/null; then
+                
+                # 检查文件是否有效
+                if [ -s "$output.tmp" ] && { head -1 "$output.tmp" | grep -q "^#EXTM3U\|^http" || head -5 "$output.tmp" | grep -q "^#EXTINF"; }; then
+                  mv "$output.tmp" "$output"
+                  local lines=$(wc -l < "$output" | tr -d ' ')
+                  local channels=$(grep -c "^#EXTINF" "$output" 2>/dev/null || echo "0")
+                  echo "✅ $name 下载成功 ($lines 行, $channels 个频道)"
+                  return 0
+                else
+                  echo "⚠️ $name 内容格式可能无效"
+                fi
               fi
-            else
-              echo "❌ $name 下载失败 (HTTP $HTTP_STATUS)"
-              rm -f "$output.tmp"
-              return 1
-            fi
+              
+              if [ $i -lt $max_retries ]; then
+                echo "等待 ${retry_delay}秒后重试..."
+                sleep $retry_delay
+              fi
+            done
+            
+            echo "❌ $name 下载失败，使用备用方案"
+            # 创建占位文件
+            cat > "$output" << EOF
+#EXTM3U
+#EXTINF:-1,⚠️ $name 暂时不可用
+# 更新时间: $(date '+%Y-%m-%d %H:%M:%S')
+# 将在下次自动更新时重试
+http://example.com
+EOF
+            return 1
           }
           
-          # 并行下载两个文件
-          if safe_download "https://raw.githubusercontent.com/mytv-android/BRTV-Live-M3U8/refs/heads/main/iptv.m3u" "source1.m3u" "IPTV列表"; then
-            SOURCE1_VALID=true
-          else
-            SOURCE1_VALID=false
-            # 创建空文件占位
-            echo "# 源文件临时不可用 - $(date '+%H:%M:%S')" > source1.m3u
-          fi
+          # 并行下载（使用后台进程）
+          download_with_retry "https://raw.githubusercontent.com/mytv-android/BRTV-Live-M3U8/main/iptv.m3u" "source1.m3u" "IPTV主列表" &
+          PID1=$!
           
-          if safe_download "https://raw.githubusercontent.com/liniani/BRTV-Live-M3U8/refs/heads/main/cctv.m3u" "source2.m3u" "CCTV列表"; then
-            SOURCE2_VALID=true
-          else
-            SOURCE2_VALID=false
-            echo "# 源文件临时不可用 - $(date '+%H:%M:%S')" > source2.m3u
-          fi
+          download_with_retry "https://raw.githubusercontent.com/liniani/BRTV-Live-M3U8/main/cctv.m3u" "source2.m3u" "CCTV列表" &
+          PID2=$!
           
-          # 输出变量供后续步骤使用
-          echo "source1_valid=$SOURCE1_VALID" >> $GITHUB_OUTPUT
-          echo "source2_valid=$SOURCE2_VALID" >> $GITHUB_OUTPUT
+          # 等待所有下载完成
+          wait $PID1 && SOURCE1_OK=true || SOURCE1_OK=false
+          wait $PID2 && SOURCE2_OK=true || SOURCE2_OK=false
           
-      - name: 4. 安全合并文件
+          # 输出结果
+          echo "source1_ok=$SOURCE1_OK" >> $GITHUB_OUTPUT
+          echo "source2_ok=$SOURCE2_OK" >> $GITHUB_OUTPUT
+          echo "download_time=$(date +%s)" >> $GITHUB_OUTPUT
+          
+      - name: 4. 智能合并处理
         id: merge
         run: |
           set -e
+          echo "🔄 开始合并文件..."
           
-          CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-          NEXT_RUN=$(date -d '+8 minutes' '+%H:%M:%S')
+          # 获取当前时间
+          CURRENT_TIME=$(date '+%Y年%m月%d日 %H:%M:%S')
+          NEXT_TIME=$(date -d '+10 minutes' '+%H:%M:%S')
+          BEIJING_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
           
-          # 统计信息
-          SOURCE1_COUNT=$(grep -c "^#EXTINF" source1.m3u 2>/dev/null || echo "0")
-          SOURCE2_COUNT=$(grep -c "^#EXTINF" source2.m3u 2>/dev/null || echo "0")
-          TOTAL=$((SOURCE1_COUNT + SOURCE2_COUNT))
+          # 统计频道数量
+          COUNT1=$(grep -c "^#EXTINF" source1.m3u 2>/dev/null || echo "0")
+          COUNT2=$(grep -c "^#EXTINF" source2.m3u 2>/dev/null || echo "0")
+          TOTAL=$((COUNT1 + COUNT2))
           
-          # 创建临时合并文件
-          TEMP_FILE="2026IPTV_temp_$(date +%s).m3u"
-          
+          # 生成最终文件
           {
             echo "#EXTM3U x-tvg-url=\"\""
-            echo "# Generated by Auto-Merger"
-            echo "# Merge Time: $CURRENT_TIME"
-            echo "# Next Update: $NEXT_RUN (每8分钟)"
-            echo "# Sources:"
-            echo "#   1. mytv-android/BRTV-Live-M3U8 (IPTV) - $SOURCE1_COUNT channels"
-            echo "#   2. liniani/BRTV-Live-M3U8 (CCTV) - $SOURCE2_COUNT channels"
+            echo "# ############################################"
+            echo "# 🎬 2026IPTV 直播源 - 自动合并版"
+            echo "# ############################################"
+            echo "#"
+            echo "# 📅 生成时间: $CURRENT_TIME (UTC)"
+            echo "# 📅 北京时间: $BEIJING_TIME"
+            echo "# 🔄 更新频率: 每10分钟自动更新"
+            echo "# ⏰ 下次更新: $NEXT_TIME (UTC)"
+            echo "#"
+            echo "# 📡 数据来源:"
+            echo "#   • IPTV列表: https://github.com/mytv-android/BRTV-Live-M3U8"
+            echo "#   • CCTV列表: https://github.com/liniani/BRTV-Live-M3U8"
+            echo "#"
+            echo "# 📊 频道统计:"
+            echo "#   • IPTV频道: $COUNT1 个"
+            echo "#   • CCTV频道: $COUNT2 个"
+            echo "#   • 总频道数: $TOTAL 个"
+            echo "#"
+            echo "# 🔗 永久链接:"
+            echo "#   https://raw.githubusercontent.com/${{ github.repository }}/main/2026IPTV.m3u"
+            echo "#"
+            echo "# 💡 使用说明:"
+            echo "#   1. 将此链接添加到支持M3U的播放器"
+            echo "#   2. 支持: VLC, Kodi, TiviMate, IPTV Smarters等"
+            echo "#   3. 文件每10分钟自动更新"
+            echo "#"
+            echo "# ⚠️ 免责声明:"
+            echo "#   本列表仅收集公开直播源，版权归原作者所有"
+            echo "#   请于24小时内删除，仅限个人测试使用"
+            echo "# ############################################"
+            echo ""
             echo ""
             
-            # 处理第一个文件
-            echo "# 📺 IPTV 直播频道 ($SOURCE1_COUNT)"
-            if [ "${{ steps.download.outputs.source1_valid }}" = "true" ] && [ "$SOURCE1_COUNT" -gt 0 ]; then
-              # 跳过M3U头，保留其他所有内容
-              grep -v "^#EXTM3U" source1.m3u || cat source1.m3u
+            # 合并第一个源
+            echo "# ========================="
+            echo "# 📺 IPTV 直播频道 ($COUNT1 个)"
+            echo "# ========================="
+            if [ "$COUNT1" -gt 0 ] && [ "${{ steps.download.outputs.source1_ok }}" = "true" ]; then
+              # 过滤掉重复的M3U头
+              grep -v "^\s*$" source1.m3u | grep -v "^#EXTM3U" | sed '/^#/! s/^/\n/'
             else
-              echo "#EXTINF:-1,频道列表暂不可用"
-              echo "# 请等待下次自动更新"
+              echo "#EXTINF:-1,频道列表暂时不可用"
+              echo "# 请等待下次自动更新 (约10分钟后)"
+              echo "http://example.com"
             fi
             
             echo ""
-            echo "# 🏠 中央电视台频道 ($SOURCE2_COUNT)"
-            if [ "${{ steps.download.outputs.source2_valid }}" = "true" ] && [ "$SOURCE2_COUNT" -gt 0 ]; then
-              grep -v "^#EXTM3U" source2.m3u || cat source2.m3u
+            echo ""
+            
+            # 合并第二个源
+            echo "# ========================="
+            echo "# 🏠 中央电视台频道 ($COUNT2 个)"
+            echo "# ========================="
+            if [ "$COUNT2" -gt 0 ] && [ "${{ steps.download.outputs.source2_ok }}" = "true" ]; then
+              grep -v "^\s*$" source2.m3u | grep -v "^#EXTM3U" | sed '/^#/! s/^/\n/'
             else
-              echo "#EXTINF:-1,频道列表暂不可用"
-              echo "# 请等待下次自动更新"
+              echo "#EXTINF:-1,频道列表暂时不可用"
+              echo "# 请等待下次自动更新 (约10分钟后)"
+              echo "http://example.com"
             fi
             
             echo ""
-            echo "# 📊 统计信息"
-            echo "# 总频道数: $TOTAL"
-            echo "# IPTV频道: $SOURCE1_COUNT"
-            echo "# CCTV频道: $SOURCE2_COUNT"
-            echo "# 生成时间戳: $(date +%s)"
-            echo "# 校验和: $(md5sum <<< "$CURRENT_TIME" | cut -d' ' -f1)"
-          } > "$TEMP_FILE"
+            echo ""
+            echo "# ############################################"
+            echo "# 🏁 文件结束"
+            echo "# 最后更新时间戳: $(date +%s)"
+            echo "# MD5校验码: $(echo "$CURRENT_TIME$TOTAL" | md5sum | cut -d' ' -f1)"
+            echo "# 总行数: $(cat source1.m3u source2.m3u 2>/dev/null | wc -l)"
+            echo "# ############################################"
+            
+          } > "2026IPTV.m3u"
           
-          # 检查是否生成了有效内容
-          if [ -s "$TEMP_FILE" ] && [ "$TOTAL" -gt 0 ]; then
-            # 替换旧文件
-            mv -f "$TEMP_FILE" "2026IPTV.m3u"
-            echo "✅ 合并文件创建成功"
-            echo "total_channels=$TOTAL" >> $GITHUB_OUTPUT
+          # 验证文件
+          if [ -s "2026IPTV.m3u" ] && grep -q "^#EXTINF" "2026IPTV.m3u" 2>/dev/null; then
+            FINAL_COUNT=$(grep -c "^#EXTINF" "2026IPTV.m3u")
+            echo "✅ 合并完成！最终频道数: $FINAL_COUNT"
             echo "merge_success=true" >> $GITHUB_OUTPUT
+            echo "final_channels=$FINAL_COUNT" >> $GITHUB_OUTPUT
           else
-            echo "⚠️ 合并文件内容为空，保留旧版本"
-            echo "merge_success=false" >> $GITHUB_OUTPUT
-            # 如果有旧文件，保留它
-            if [ -f "2026IPTV.m3u" ]; then
-              echo "📁 使用已有的 2026IPTV.m3u 文件"
+            echo "⚠️ 合并文件可能为空，尝试使用缓存"
+            if [ -f "2026IPTV_backup.m3u" ]; then
+              cp "2026IPTV_backup.m3u" "2026IPTV.m3u"
+              echo "🔄 使用备份文件"
+              echo "merge_success=false" >> $GITHUB_OUTPUT
+            else
+              echo "❌ 无可用备份，创建空文件"
+              echo "merge_success=false" >> $GITHUB_OUTPUT
             fi
           fi
           
-      - name: 5. 智能Git推送（避免冲突）
+          # 创建备份
+          cp "2026IPTV.m3u" "2026IPTV_backup.m3u"
+          
+      - name: 5. 智能Git提交
         if: steps.merge.outputs.merge_success == 'true'
+        env:
+          GIT_STRATEGY: recursive
         run: |
-          set -e
+          echo "💾 准备提交更改..."
           
-          echo "🔧 配置Git环境..."
-          git config --global user.name 'GitHub Actions Bot'
-          git config --global user.email 'github-actions@github.com'
+          # 配置Git
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git config --global pull.rebase true
           
-          # 确保是最新版本
-          echo "📡 拉取最新仓库状态..."
-          git pull origin main --rebase --autostash || true
+          # 拉取最新代码（避免冲突）
+          echo "📡 同步远程仓库..."
+          git pull origin main --no-edit --strategy=recursive -Xtheirs || \
+          git pull origin main --no-edit --allow-unrelated-histories || true
           
           # 添加文件
-          git add -f 2026IPTV.m3u
+          git add -f 2026IPTV.m3u 2026IPTV_backup.m3u
           
-          # 检查是否有实际更改
+          # 检查是否有变化
           if git diff --cached --quiet; then
-            echo "📄 文件内容无变化，跳过提交"
+            echo "📄 文件无变化，跳过提交"
+            echo "git_updated=false" >> $GITHUB_OUTPUT
           else
-            echo "💾 准备提交更改..."
+            # 生成提交信息
+            CHANNELS="${{ steps.merge.outputs.final_channels }}"
+            COMMIT_MSG="🔄 IPTV列表更新 $(date '+%m-%d %H:%M')"
+            COMMIT_DESC="频道总数: $CHANNELS | 自动更新 | 每10分钟"
             
-            # 生成有意义的提交信息
-            COMMIT_TIME=$(date '+%Y-%m-%d %H:%M')
-            CHANNEL_COUNT="${{ steps.merge.outputs.total_channels }}"
+            # 提交
+            git commit -m "$COMMIT_MSG" \
+                       -m "$COMMIT_DESC" \
+                       -m "来源: mytv-android/BRTV-Live-M3U8 + liniani/BRTV-Live-M3U8"
             
-            git commit -m "🔄 IPTV列表更新 $COMMIT_TIME" \
-                       -m "频道总数: $CHANNEL_COUNT | 自动更新" \
-                       --allow-empty
-            
-            # 安全推送（最多重试3次）
+            # 安全推送（带重试）
             for i in {1..3}; do
-              echo "🚀 尝试推送 (#$i)..."
+              echo "🚀 推送尝试 #$i..."
               if git push origin main; then
                 echo "✅ 推送成功"
+                echo "git_updated=true" >> $GITHUB_OUTPUT
                 break
+              elif [ $i -eq 3 ]; then
+                echo "❌ 推送失败，已重试3次"
+                echo "git_updated=false" >> $GITHUB_OUTPUT
               else
-                echo "⚠️ 推送失败，等待10秒后重试..."
+                echo "⏸️ 推送失败，10秒后重试..."
                 sleep 10
                 git pull origin main --rebase
               fi
             done
           fi
           
-      - name: 6. 验证与清理
+      - name: 6. 生成状态报告
+        if: always()
         run: |
-          echo "📋 最终验证检查"
-          echo "========================"
+          echo "📋 ================================"
+          echo "📋 工作流执行报告"
+          echo "📋 ================================"
+          echo ""
           
+          # 文件信息
           if [ -f "2026IPTV.m3u" ]; then
             FILE_SIZE=$(wc -l < "2026IPTV.m3u")
-            FILE_AGE=$(($(date +%s) - $(stat -c %Y "2026IPTV.m3u" 2>/dev/null || echo 0)))
+            FILE_CHANNELS=$(grep -c "^#EXTINF" "2026IPTV.m3u" 2>/dev/null || echo "0")
+            FILE_AGE=$(( $(date +%s) - $(stat -c %Y "2026IPTV.m3u" 2>/dev/null || echo 0) ))
             
-            echo "📁 文件名: 2026IPTV.m3u"
+            echo "📁 最终文件: 2026IPTV.m3u"
             echo "📏 文件行数: $FILE_SIZE"
-            echo "⏱️  文件年龄: ${FILE_AGE}秒"
+            echo "📺 频道数量: $FILE_CHANNELS"
+            echo "⏱️  生成时间: ${FILE_AGE}秒前"
             echo ""
-            echo "📄 文件头部预览:"
-            head -8 "2026IPTV.m3u"
+            echo "📄 文件预览（前3个频道）:"
+            echo "------------------------"
+            grep -A1 "^#EXTINF" "2026IPTV.m3u" | head -6
             echo ""
-            echo "📄 文件尾部预览:"
-            tail -5 "2026IPTV.m3u"
-            echo ""
-            
-            # 计算频道数
-            CHANNELS=$(grep -c "^#EXTINF" "2026IPTV.m3u" 2>/dev/null || echo "0")
-            echo "📺 实际频道数量: $CHANNELS"
-            
           else
             echo "❌ 错误：最终文件未生成"
           fi
           
+          # 时间信息
+          echo "⏰ 时间信息:"
+          echo "  UTC时间: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "  北京时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          echo "  下次运行: $(date -d '+10 minutes' '+%H:%M:%S') (UTC)"
           echo ""
-          echo "🔗 访问链接:"
-          echo "原始链接: https://raw.githubusercontent.com/${{ github.repository }}/main/2026IPTV.m3u"
-          echo "防缓存链接: https://raw.githubusercontent.com/${{ github.repository }}/main/2026IPTV.m3u?v=$(date +%s)"
           
+          # 访问链接
+          echo "🔗 访问链接:"
+          echo "  直接访问: https://raw.githubusercontent.com/${{ github.repository }}/main/2026IPTV.m3u"
+          echo "  带缓存刷新: https://raw.githubusercontent.com/${{ github.repository }}/main/2026IPTV.m3u?t=$(date +%s)"
           echo ""
-          echo "⏰ 下次运行时间:"
-          echo "- UTC: $(date -d '+8 minutes' '+%H:%M:%S')"
-          echo "- 北京时间: $(TZ=Asia/Shanghai date -d '+8 minutes' '+%H:%M:%S')"
           
           # 清理临时文件
-          rm -f source1.m3u source2.m3u 2026IPTV_temp_*.m3u
+          rm -f source1.m3u source2.m3u *.tmp
           echo "🧹 临时文件已清理"
           
-      - name: 7. 失败通知（仅错误时运行）
+      - name: 7. 失败通知（可选）
         if: failure()
         run: |
           echo "❌ 工作流执行失败！"
           echo ""
-          echo "可能的原因:"
-          echo "1. 🔌 网络连接问题 - 源站无法访问"
-          echo "2. 🔐 权限问题 - GitHub Token失效"
-          echo "3. 📄 文件格式问题 - 源文件不是有效的M3U格式"
-          echo "4. ⏱️  超时问题 - 下载或处理时间过长"
+          echo "🔍 可能原因:"
+          echo "  • 🌐 网络连接问题 - 源站无法访问"
+          echo "  • ⏱️  超时问题 - 下载时间过长"
+          echo "  • 🔐 权限问题 - Git推送失败"
+          echo "  • 💾 磁盘空间不足"
           echo ""
           echo "💡 解决方案:"
-          echo "1. 检查源URL是否可访问"
-          echo "2. 查看上方的详细错误日志"
-          echo "3. 等待下一次自动重试（8分钟后）"
-          echo "4. 手动运行工作流测试"
+          echo "  1. 检查源URL是否可访问"
+          echo "  2. 手动运行工作流测试"
+          echo "  3. 等待下一次自动重试（10分钟后）"
+          echo "  4. 查看详细日志定位问题"
+          echo ""
+          echo "📞 调试信息:"
+          echo "  工作流: ${{ github.workflow }}"
+          echo "  触发事件: ${{ github.event_name }}"
+          echo "  提交: ${{ github.sha }}"
