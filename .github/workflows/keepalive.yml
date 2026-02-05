@@ -1,0 +1,40 @@
+name: 🔄 保持仓库活跃 (防定时任务停用)
+
+on:
+  # 每周运行一次，保持仓库活跃
+  schedule:
+    - cron: '0 0 * * 0'  # 每周日UTC时间0点（北京时间周一8点）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 📝 创建活跃标记文件
+        run: |
+          echo "此文件用于保持仓库活跃，防止GitHub禁用定时工作流。" > .github/keepalive.txt
+          echo "最后活跃时间: $(date '+%Y-%m-%d %H:%M:%S') (北京时间)" >> .github/keepalive.txt
+          echo "仓库: ${{ github.repository }}" >> .github/keepalive.txt
+      
+      - name: 📤 提交更新
+        run: |
+          git config --global user.name "GitHub Keepalive Bot"
+          git config --global user.email "actions@github.com"
+          
+          git add .github/keepalive.txt
+          
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "🔄 保持仓库活跃 [$(date '+%m-%d %H:%M')]" \
+                       -m "确保定时任务不被停用"
+            git push origin main
+            echo "✅ 活跃状态已更新"
+          fi
